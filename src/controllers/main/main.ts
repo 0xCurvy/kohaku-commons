@@ -95,6 +95,7 @@ import { TransferController } from '../transfer/transfer'
 import { PrivacyPoolsController } from '../privacyPools/privacyPools'
 import { PrivacyPoolsV1Controller } from '../privacyPools/privacyPoolsV1'
 import { RailgunController } from '../railgun/railgun'
+import { CurvyTestController } from '../curvyTest/curvyTest'
 
 const STATUS_WRAPPED_METHODS = {
   removeAccount: 'INITIAL',
@@ -167,6 +168,8 @@ export class MainController extends EventEmitter {
   privacyPoolsV1: PrivacyPoolsV1Controller
 
   railgun: RailgunController
+
+  curvyTest: CurvyTestController
 
   signAccountOp: SignAccountOpController | null = null
 
@@ -555,6 +558,8 @@ export class MainController extends EventEmitter {
       railgunRelayerUrl,
       this.fetch
     )
+
+    this.curvyTest = new CurvyTestController(this.keystore, this.networks, this.selectedAccount)
   }
 
   /**
