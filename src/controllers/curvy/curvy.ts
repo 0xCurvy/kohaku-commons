@@ -2,6 +2,19 @@ import EventEmitter from '../eventEmitter/eventEmitter'
 import type { KeystoreController } from '../keystore/keystore'
 import type { NetworksController } from '../networks/networks'
 import type { SelectedAccountController } from '../selectedAccount/selectedAccount'
+import type { AccountsController } from '../accounts/accounts'
+import type { ProvidersController } from '../providers/providers'
+import type { PortfolioController } from '../portfolio/portfolio'
+import type { ActivityController } from '../activity/activity'
+import type { ExternalSignerControllers } from '../../interfaces/keystore'
+import { SignAccountOpController } from '../signAccountOp/signAccountOp'
+import { AccountOp } from '../../libs/accountOp/accountOp'
+import { Call } from '../../libs/accountOp/types'
+import { getBaseAccount } from '../../libs/account/getBaseAccount'
+import { getAmbirePaymasterService } from '../../libs/erc7677/erc7677'
+import { randomId } from '../../libs/humanizer/utils'
+import { EstimationStatus } from '../estimation/types'
+import wait from '../../utils/wait'
 import { hostFactory } from '../privacyPools/hostFactory'
 
 export type CurvyStatus = 'idle' | 'initializing' | 'ready' | 'error'
@@ -13,10 +26,24 @@ export class CurvyController extends EventEmitter {
 
   #selectedAccount: SelectedAccountController
 
+  #accounts: AccountsController
+
+  #providers: ProvidersController
+
+  #portfolio: PortfolioController
+
+  #activity: ActivityController
+
+  #externalSignerControllers: ExternalSignerControllers
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   #plugin: any = null
 
   #initializing = false
+
+  #signAccountOpSubscriptions: Function[] = []
+
+  #reestimateAbortController: AbortController | null = null
 
   curvyId: string | null = null
 
@@ -28,15 +55,33 @@ export class CurvyController extends EventEmitter {
 
   lastResult: any = null
 
+  signAccountOpController: SignAccountOpController | null = null
+
+  hasProceeded: boolean = false
+
+  latestBroadcastedAccountOp: AccountOp | null = null
+
+  shouldTrackLatestBroadcastedAccountOp: boolean = true
+
   constructor(
     keystore: KeystoreController,
     networks: NetworksController,
-    selectedAccount: SelectedAccountController
+    selectedAccount: SelectedAccountController,
+    accounts: AccountsController,
+    providers: ProvidersController,
+    portfolio: PortfolioController,
+    activity: ActivityController,
+    externalSignerControllers: ExternalSignerControllers
   ) {
     super()
     this.#keystore = keystore
     this.#networks = networks
     this.#selectedAccount = selectedAccount
+    this.#accounts = accounts
+    this.#providers = providers
+    this.#portfolio = portfolio
+    this.#activity = activity
+    this.#externalSignerControllers = externalSignerControllers
   }
 
   async init(params: {
@@ -155,11 +200,175 @@ export class CurvyController extends EventEmitter {
       this.error = null
       const result = await this.#plugin.prepareShield(asset)
       this.lastResult = result
+
+      // Convert ShieldTx[] → AccountOp calls and feed into signing pipeline
+      const txs: Array<{ to: string; data: string; value: bigint }> = result?.txs ?? []
+      if (txs.length > 0) {
+        const calls: Call[] = txs.map((tx) => ({
+          to: tx.to as `0x${string}`,
+          data: tx.data as `0x${string}`,
+          value: BigInt(tx.value ?? 0)
+        }))
+        await this.syncSignAccountOp(calls)
+      }
     } catch (e: any) {
       this.error = e?.message ?? String(e)
       this.lastResult = { error: this.error }
     }
 
+    this.emitUpdate()
+  }
+
+  async syncSignAccountOp(calls: Call[]): Promise<void> {
+    if (!this.#selectedAccount?.account) return
+    if (!calls.length) return
+
+    try {
+      this.shouldTrackLatestBroadcastedAccountOp = true
+
+      if (this.signAccountOpController) {
+        this.destroySignAccountOp()
+      }
+
+      this.hasProceeded = false
+
+      await this.#initSignAccOp(calls)
+    } catch (error) {
+      this.emitError({
+        level: 'major',
+        message: 'Failed to initialize transaction signing',
+        error: error instanceof Error ? error : new Error('Unknown error in syncSignAccountOp')
+      })
+    }
+  }
+
+  async #initSignAccOp(calls: Call[]): Promise<void> {
+    if (!this.#selectedAccount?.account || this.signAccountOpController || !this.#accounts) return
+
+    const chainId = 11155111n
+    const network = this.#networks.networks.find((net) => net.chainId === chainId)
+    if (!network) return
+
+    const provider = this.#providers.providers[network.chainId.toString()]
+    const accountState = await this.#accounts.getOrFetchAccountOnChainState(
+      this.#selectedAccount.account.addr,
+      network.chainId
+    )
+
+    if (!this.#keystore) return
+
+    const baseAcc = getBaseAccount(
+      this.#selectedAccount.account,
+      accountState,
+      this.#keystore.getAccountKeys(this.#selectedAccount.account),
+      network
+    )
+
+    const accountOp: AccountOp = {
+      accountAddr: this.#selectedAccount.account.addr,
+      chainId: network.chainId,
+      signingKeyAddr: null,
+      signingKeyType: null,
+      gasLimit: null,
+      gasFeePayment: null,
+      nonce: accountState.nonce,
+      signature: null,
+      accountOpToExecuteBefore: null,
+      calls,
+      meta: {
+        paymasterService: getAmbirePaymasterService(baseAcc, '')
+      }
+    }
+
+    this.signAccountOpController = new SignAccountOpController(
+      this.#accounts,
+      this.#networks,
+      this.#keystore,
+      this.#portfolio,
+      this.#activity,
+      this.#externalSignerControllers,
+      this.#selectedAccount.account,
+      network,
+      provider,
+      randomId(),
+      accountOp,
+      () => true,
+      false,
+      undefined
+    )
+
+    this.#signAccountOpSubscriptions.push(
+      this.signAccountOpController.onUpdate(() => {
+        this.emitUpdate()
+      })
+    )
+    this.#signAccountOpSubscriptions.push(
+      this.signAccountOpController.onError((error) => {
+        if (this.signAccountOpController)
+          this.#portfolio.overridePendingResults(this.signAccountOpController.accountOp)
+        this.emitError(error)
+      })
+    )
+
+    if (this.signAccountOpController) {
+      // eslint-disable-next-line @typescript-eslint/no-floating-promises
+      this.signAccountOpController.estimate()
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-floating-promises
+    this.#reestimate()
+  }
+
+  async #reestimate(): Promise<void> {
+    if (!this.signAccountOpController || this.#reestimateAbortController) return
+
+    this.#reestimateAbortController = new AbortController()
+    const signal = this.#reestimateAbortController!.signal
+
+    const loop = async () => {
+      // eslint-disable-next-line no-await-in-loop
+      await wait(30000)
+
+      while (!signal.aborted) {
+        if (signal.aborted) break
+
+        if (this.signAccountOpController?.estimation.status !== EstimationStatus.Loading) {
+          // eslint-disable-next-line no-await-in-loop
+          await this.signAccountOpController?.estimate()
+        }
+
+        // eslint-disable-next-line no-await-in-loop
+        await wait(30000)
+      }
+    }
+
+    loop().catch(() => {})
+  }
+
+  destroySignAccountOp(): void {
+    this.#reestimateAbortController?.abort()
+    this.#reestimateAbortController = null
+
+    this.#signAccountOpSubscriptions.forEach((unsub) => unsub())
+    this.#signAccountOpSubscriptions = []
+
+    if (this.signAccountOpController) {
+      this.signAccountOpController.reset()
+      this.signAccountOpController = null
+    }
+
+    this.hasProceeded = false
+    this.emitUpdate()
+  }
+
+  destroyLatestBroadcastedAccountOp(): void {
+    this.shouldTrackLatestBroadcastedAccountOp = false
+    this.latestBroadcastedAccountOp = null
+    this.emitUpdate()
+  }
+
+  setUserProceeded(hasProceeded: boolean): void {
+    this.hasProceeded = hasProceeded
     this.emitUpdate()
   }
 
@@ -204,12 +413,14 @@ export class CurvyController extends EventEmitter {
   }
 
   destroy(): void {
+    this.destroySignAccountOp()
     this.#plugin = null
     this.curvyId = null
     this.balance = []
     this.status = 'idle'
     this.error = null
     this.lastResult = null
+    this.latestBroadcastedAccountOp = null
     this.emitUpdate()
   }
 }
