@@ -568,7 +568,8 @@ export class MainController extends EventEmitter {
       this.providers,
       this.portfolio,
       this.activity,
-      this.#externalSignerControllers
+      this.#externalSignerControllers,
+      this.storage
     )
   }
 

@@ -8,6 +8,7 @@ import type { PortfolioController } from '../portfolio/portfolio'
 import type { ActivityController } from '../activity/activity'
 import type { ExternalSignerControllers } from '../../interfaces/keystore'
 import { SignAccountOpController } from '../signAccountOp/signAccountOp'
+import { StorageController } from '../storage/storage'
 import { AccountOp } from '../../libs/accountOp/accountOp'
 import { Call } from '../../libs/accountOp/types'
 import { getBaseAccount } from '../../libs/account/getBaseAccount'
@@ -35,6 +36,8 @@ export class CurvyController extends EventEmitter {
   #activity: ActivityController
 
   #externalSignerControllers: ExternalSignerControllers
+
+  #storage: StorageController
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   #plugin: any = null
@@ -71,7 +74,8 @@ export class CurvyController extends EventEmitter {
     providers: ProvidersController,
     portfolio: PortfolioController,
     activity: ActivityController,
-    externalSignerControllers: ExternalSignerControllers
+    externalSignerControllers: ExternalSignerControllers,
+    storage: StorageController
   ) {
     super()
     this.#keystore = keystore
@@ -82,6 +86,7 @@ export class CurvyController extends EventEmitter {
     this.#portfolio = portfolio
     this.#activity = activity
     this.#externalSignerControllers = externalSignerControllers
+    this.#storage = storage
   }
 
   async init(params: {
@@ -132,6 +137,13 @@ export class CurvyController extends EventEmitter {
       const account = this.#selectedAccount.account
       if (!account) throw new Error('No account selected')
 
+      // Load persisted curvyId for this account, or use the one from params,
+      // or generate a new one for first-time registration.
+      const storageKey = `curvy:id:${account.addr}`
+      const storedCurvyId = await this.#storage.get(storageKey, null as string | null)
+      const curvyId =
+        params.curvyId ?? storedCurvyId ?? `kh-${randomId().toString(36).slice(0, 16)}`
+
       // Resolve WASM URL for the Curvy SDK core module.
       // In extension context, chrome.runtime.getURL points to the file
       // copied into the build output by webpack (CopyPlugin).
@@ -147,13 +159,14 @@ export class CurvyController extends EventEmitter {
           signatureParams: {} as any,
           signatureResult: '0x' as any
         },
-        curvyId: params.curvyId as any,
-        environment: params.environment ?? 'testnet',
+        curvyId: curvyId as any,
+        environment: (params.environment === 'testnet' ? 'testnet' : undefined),
         apiBaseUrl: params.apiBaseUrl,
         wasmUrl
       })
 
       this.curvyId = (await this.#plugin.instanceId()) as string
+      await this.#storage.set(storageKey, this.curvyId)
       this.status = 'ready'
       this.lastResult = { curvyId: this.curvyId }
     } catch (e: any) {
@@ -170,6 +183,8 @@ export class CurvyController extends EventEmitter {
   }
 
   async fetchBalance(): Promise<void> {
+    // eslint-disable-next-line no-console
+    console.log('[CurvyController] fetchBalance called, hasPlugin:', !!this.#plugin, 'status:', this.status)
     if (!this.#plugin) {
       this.error = 'Plugin not initialized'
       this.emitUpdate()
@@ -179,9 +194,13 @@ export class CurvyController extends EventEmitter {
     try {
       this.error = null
       const result = await this.#plugin.balance(undefined)
+      // eslint-disable-next-line no-console
+      console.log('[CurvyController] fetchBalance result:', JSON.stringify(result, (_, v) => typeof v === 'bigint' ? v.toString() : v))
       this.balance = result as any[]
       this.lastResult = result
     } catch (e: any) {
+      // eslint-disable-next-line no-console
+      console.error('[CurvyController] fetchBalance error:', e)
       this.error = e?.message ?? String(e)
       this.lastResult = { error: this.error }
     }
@@ -190,6 +209,8 @@ export class CurvyController extends EventEmitter {
   }
 
   async prepareShield(asset: any): Promise<void> {
+    // eslint-disable-next-line no-console
+    console.log('[CurvyController] prepareShield called', { asset, hasPlugin: !!this.#plugin, status: this.status })
     if (!this.#plugin) {
       this.error = 'Plugin not initialized'
       this.emitUpdate()
@@ -198,11 +219,17 @@ export class CurvyController extends EventEmitter {
 
     try {
       this.error = null
+      // eslint-disable-next-line no-console
+      console.log('[CurvyController] calling plugin.prepareShield...')
       const result = await this.#plugin.prepareShield(asset)
+      // eslint-disable-next-line no-console
+      console.log('[CurvyController] plugin.prepareShield result:', result)
       this.lastResult = result
 
       // Convert ShieldTx[] → AccountOp calls and feed into signing pipeline
       const txs: Array<{ to: string; data: string; value: bigint }> = result?.txs ?? []
+      // eslint-disable-next-line no-console
+      console.log('[CurvyController] prepareShield txs:', txs.length, txs)
       if (txs.length > 0) {
         const calls: Call[] = txs.map((tx) => ({
           to: tx.to as `0x${string}`,
@@ -210,8 +237,14 @@ export class CurvyController extends EventEmitter {
           value: BigInt(tx.value ?? 0)
         }))
         await this.syncSignAccountOp(calls)
+      } else {
+        // eslint-disable-next-line no-console
+        console.warn('[CurvyController] prepareShield returned 0 txs – signAccountOpController will NOT be created')
+        this.error = 'Shield preparation returned no transactions. Please try again.'
       }
     } catch (e: any) {
+      // eslint-disable-next-line no-console
+      console.error('[CurvyController] prepareShield error:', e)
       this.error = e?.message ?? String(e)
       this.lastResult = { error: this.error }
     }
@@ -220,6 +253,8 @@ export class CurvyController extends EventEmitter {
   }
 
   async syncSignAccountOp(calls: Call[]): Promise<void> {
+    // eslint-disable-next-line no-console
+    console.log('[CurvyController] syncSignAccountOp', { callsCount: calls.length, hasAccount: !!this.#selectedAccount?.account })
     if (!this.#selectedAccount?.account) return
     if (!calls.length) return
 
@@ -233,7 +268,11 @@ export class CurvyController extends EventEmitter {
       this.hasProceeded = false
 
       await this.#initSignAccOp(calls)
+      // eslint-disable-next-line no-console
+      console.log('[CurvyController] syncSignAccountOp complete, signAccountOpController:', !!this.signAccountOpController)
     } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error('[CurvyController] syncSignAccountOp error:', error)
       this.emitError({
         level: 'major',
         message: 'Failed to initialize transaction signing',
@@ -243,10 +282,14 @@ export class CurvyController extends EventEmitter {
   }
 
   async #initSignAccOp(calls: Call[]): Promise<void> {
+    // eslint-disable-next-line no-console
+    console.log('[CurvyController] #initSignAccOp', { hasAccount: !!this.#selectedAccount?.account, alreadyHasController: !!this.signAccountOpController })
     if (!this.#selectedAccount?.account || this.signAccountOpController || !this.#accounts) return
 
     const chainId = 11155111n
     const network = this.#networks.networks.find((net) => net.chainId === chainId)
+    // eslint-disable-next-line no-console
+    console.log('[CurvyController] #initSignAccOp network:', network?.name, network?.chainId?.toString())
     if (!network) return
 
     const provider = this.#providers.providers[network.chainId.toString()]

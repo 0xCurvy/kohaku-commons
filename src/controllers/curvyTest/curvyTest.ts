@@ -103,7 +103,7 @@ export class CurvyTestController extends EventEmitter {
           signatureResult: '0x' as any
         },
         curvyId: params.curvyId as any,
-        environment: params.environment ?? 'testnet',
+        environment: 'testnet',
         apiBaseUrl: params.apiBaseUrl,
         wasmUrl
       })
