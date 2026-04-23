@@ -78,6 +78,7 @@ import { ProvidersController } from '../providers/providers'
 import { RequestsController } from '../requests/requests'
 import { SelectedAccountController } from '../selectedAccount/selectedAccount'
 import {
+  SIGN_ACCOUNT_OP_CURVY,
   SIGN_ACCOUNT_OP_MAIN,
   SIGN_ACCOUNT_OP_PRIVACY_POOLS,
   SIGN_ACCOUNT_OP_PRIVACY_POOLS_V1,
@@ -95,6 +96,7 @@ import { TransferController } from '../transfer/transfer'
 import { PrivacyPoolsController } from '../privacyPools/privacyPools'
 import { PrivacyPoolsV1Controller } from '../privacyPools/privacyPoolsV1'
 import { RailgunController } from '../railgun/railgun'
+import { CurvyController } from '../curvy/curvy'
 
 const STATUS_WRAPPED_METHODS = {
   removeAccount: 'INITIAL',
@@ -167,6 +169,8 @@ export class MainController extends EventEmitter {
   privacyPoolsV1: PrivacyPoolsV1Controller
 
   railgun: RailgunController
+
+  curvy: CurvyController
 
   signAccountOp: SignAccountOpController | null = null
 
@@ -555,6 +559,18 @@ export class MainController extends EventEmitter {
       railgunRelayerUrl,
       this.fetch
     )
+
+    this.curvy = new CurvyController(
+      this.keystore,
+      this.networks,
+      this.selectedAccount,
+      this.accounts,
+      this.providers,
+      this.portfolio,
+      this.activity,
+      this.#externalSignerControllers,
+      this.storage
+    )
   }
 
   /**
@@ -835,6 +851,8 @@ export class MainController extends EventEmitter {
       signAccountOp = this.privacyPoolsV1.signAccountOpController
     } else if (type === SIGN_ACCOUNT_OP_RAILGUN) {
       signAccountOp = this.railgun.signAccountOpController
+    } else if (type === SIGN_ACCOUNT_OP_CURVY) {
+      signAccountOp = this.curvy.signAccountOpController
     } else {
       signAccountOp = this.transfer.signAccountOpController
     }
@@ -2148,6 +2166,14 @@ export class MainController extends EventEmitter {
       // This prevents stale state issues on subsequent deposits
       // The SignAccountOpController will be destroyed when user navigates away
       this.railgun.resetForm()
+    }
+
+    if (type === SIGN_ACCOUNT_OP_CURVY) {
+      if (this.curvy.shouldTrackLatestBroadcastedAccountOp) {
+        this.curvy.latestBroadcastedAccountOp = submittedAccountOp
+      }
+
+      this.curvy.destroySignAccountOp()
     }
 
     await this.#notificationManager.create({
